@@ -9,42 +9,59 @@ No prior Python, web, or computer-vision knowledge assumed.
 
 1. [The Big Picture](#1--the-big-picture)
 2. [The Files](#2--the-files)
-3. [requirements.txt](#3--requirementstxt-the-shopping-list)
-4. [app.py — Imports](#4--apppy--imports)
-5. [app.py — Configuration Constants](#5--apppy--configuration-constants)
-6. [app.py — Camera Initialisation](#6--apppy--camera-initialisation)
-7. [app.py — YOLO Model Loading](#7--apppy--yolo-model-loading)
-8. [app.py — Camera Cleanup](#8--apppy--camera-cleanup-atexit)
-9. [app.py — process_frame()](#9--apppy--process_frame-the-brain)
-10. [app.py — generate_frames()](#10--apppy--generate_frames-the-heartbeat)
-11. [app.py — Flask Routes](#11--apppy--flask-routes-the-web-server)
-12. [app.py — Entry Point](#12--apppy--entry-point-if-__name__--__main__)
-13. [templates/index.html](#13--templatesindexhtml-the-web-page)
-14. [How All the Pieces Connect](#14--how-all-the-pieces-connect)
-15. [How to Run It](#15--how-to-run-it)
-16. [Glossary](#16--glossary)
+3. [Why Not PyTorch / Ultralytics?](#3--why-not-pytorch--ultralytics)
+4. [requirements.txt](#4--requirementstxt-the-shopping-list)
+5. [app.py — Imports](#5--apppy--imports)
+6. [app.py — Configuration Constants](#6--apppy--configuration-constants)
+7. [app.py — Camera Initialisation](#7--apppy--camera-initialisation)
+8. [app.py — YOLO Model Loading (cv2.dnn)](#8--apppy--yolo-model-loading-cv2dnn)
+9. [app.py — Camera Cleanup (atexit)](#9--apppy--camera-cleanup-atexit)
+10. [app.py — Scale Factors](#10--apppy--scale-factors)
+11. [app.py — process_frame() — The Brain](#11--apppy--process_frame--the-brain)
+    - [Step 1: Colour Fix](#step-1--colour-fix)
+    - [Step 2: Blob Creation](#step-2--blob-creation)
+    - [Step 3: Forward Pass](#step-3--forward-pass)
+    - [Step 4: Tensor Parsing](#step-4--tensor-parsing)
+    - [Step 5–6: Filtering + NMS](#steps-56--filtering--nms)
+    - [Step 7: Annotation](#step-7--annotation)
+12. [app.py — generate_frames()](#12--apppy--generate_frames-the-heartbeat)
+13. [app.py — Flask Routes](#13--apppy--flask-routes-the-web-server)
+14. [app.py — Entry Point](#14--apppy--entry-point)
+15. [templates/index.html](#15--templatesindexhtml-the-web-page)
+16. [How All the Pieces Connect](#16--how-all-the-pieces-connect)
+17. [How to Run It](#17--how-to-run-it)
+18. [Glossary](#18--glossary)
 
 ---
 
 ## 1 — The Big Picture
 
-You have a **Raspberry Pi** with a **camera** attached via a ribbon
-cable. You want to see what the camera sees — live — on **any phone or
-laptop** on your Wi-Fi, *and* have an AI model detect people in the
-frame and draw green boxes around them.
+You have a **Raspberry Pi 4B** with a **camera** attached via a ribbon
+cable. You want to:
+
+1. See what the camera sees **live** on any phone or laptop on your
+   Wi-Fi.
+2. Have an **AI model** detect people in the frame and draw green boxes
+   around them — in real time.
+
+The data flows like this:
 
 ```
-┌──────────────┐         ┌─────────────────────────┐         ┌──────────────┐
-│   Camera     │  ──▶    │   Python app on the Pi   │  ──▶    │  Your phone  │
-│  (Arducam    │  raw    │  1. Grab frame           │  JPEG   │  or laptop   │
-│   IMX708)    │  pixels │  2. Fix colours           │  stream │  (browser)   │
-│              │         │  3. YOLO person detection │         │              │
-│              │         │  4. Compress to JPEG      │         │              │
-│              │         │  5. Stream over HTTP      │         │              │
-└──────────────┘         └─────────────────────────┘         └──────────────┘
+┌──────────────┐         ┌──────────────────────────┐         ┌──────────────┐
+│   Camera     │  ──▶    │   Python app on the Pi    │  ──▶    │  Your phone  │
+│  (Arducam    │  raw    │  1. Grab frame            │  JPEG   │  or laptop   │
+│   IMX708)    │  pixels │  2. Fix colours            │  stream │  (browser)   │
+│              │         │  3. Build 640×640 blob     │         │              │
+│              │         │  4. YOLO neural-net pass   │         │              │
+│              │         │  5. Filter: persons only   │         │              │
+│              │         │  6. Remove duplicate boxes │         │              │
+│              │         │  7. Draw green boxes       │         │              │
+│              │         │  8. Compress to JPEG       │         │              │
+│              │         │  9. Stream over HTTP       │         │              │
+└──────────────┘         └──────────────────────────┘         └──────────────┘
 ```
 
-This streaming trick is called **MJPEG** (Motion JPEG). The server
+The streaming trick is called **MJPEG** (Motion JPEG). The server
 sends a never-ending sequence of JPEG images; the browser replaces the
 displayed image each time a new one arrives, making it look like video.
 
@@ -54,216 +71,235 @@ displayed image each time a new one arrives, making it look like video.
 
 ```
 yolo-fun/
-├── app.py                    ← The main Python program (the server + AI)
+├── app.py                    ← The main Python program (server + AI)
+├── yolo11n.onnx              ← The AI model file (you create this once)
 ├── requirements.txt          ← Lists the Python packages we need
-├── yolo11n_ncnn_model/       ← The AI model files (you create this once)
 └── templates/
     └── index.html            ← The web page your browser loads
 ```
 
 ---
 
-## 3 — `requirements.txt` (the shopping list)
+## 3 — Why Not PyTorch / Ultralytics?
+
+You might see YOLO tutorials that say `from ultralytics import YOLO`.
+That pulls in **PyTorch**, a huge machine-learning framework. Here's
+why we can't use it:
+
+| Problem | Detail |
+|---|---|
+| **CPU mismatch** | PyTorch ≥ 2.6 is compiled with ARMv8.2 instructions (optimised for Pi 5). The Pi 4 has an ARMv8.0 CPU. When the Pi 4 hits an instruction it physically doesn't have, the Linux kernel kills the program with **SIGILL** (Illegal Instruction) |
+| **No downgrade path** | PyTorch 2.5.1 supports ARMv8.0, but has no pre-built wheel for Python 3.13. Building from source takes hours and often fails |
+| **System Python is locked** | Downgrading to Python 3.11 would break the system-installed `picamera2` driver |
+
+**The escape route:** OpenCV has its own inference engine (`cv2.dnn`)
+that can load ONNX models directly. Its C++ backend **probes the CPU
+at runtime** and only uses instructions the hardware actually supports.
+No PyTorch needed. No SIGILL.
+
+---
+
+## 4 — `requirements.txt` (the shopping list)
 
 ```text
 flask>=3.0,<4.0
 opencv-python-headless>=4.8,<5.0
-ultralytics>=8.3,<9.0
+numpy>=1.26,<3.0
 ```
 
-Before running the app you say `pip install -r requirements.txt` and
-Python downloads these three libraries:
+You install these with `pip install -r requirements.txt`. Python
+downloads three libraries:
 
 | Package | What it does |
 |---|---|
-| **Flask** | A lightweight web-server framework — lets us say *"when someone visits this URL, give them this response"* |
-| **opencv-python-headless** | Computer-vision library — we use it for colour conversion, JPEG encoding, and drawing boxes. The `-headless` suffix means it skips GUI/display code the Pi doesn't need |
-| **ultralytics** | The official YOLO library — loads the AI model and runs object detection on images |
+| **Flask** | Lightweight web-server framework — lets us say *"when someone visits this URL, give them this response"* |
+| **opencv-python-headless** | Computer-vision library — we use it for: colour conversion, blob creation, neural-net inference (`cv2.dnn`), JPEG encoding, and drawing boxes. The `-headless` suffix skips GUI code the Pi doesn't need |
+| **NumPy** | Numerical array library — lets us slice and reshape the raw tensor output from the neural network |
 
 ### What about Picamera2?
 
-It's **pre-installed** on Raspberry Pi OS. You should **not** pip-install
-it. It comes from the system package manager (`apt install python3-picamera2`).
+Pre-installed on Raspberry Pi OS. Do **not** pip-install it. It comes
+from the system APT package manager (`apt install python3-picamera2`).
 
 ### Version range syntax
 
-`>=3.0,<4.0` means *"any version from 3.0 up to (but not including) 4.0"*.
-This ensures you get a compatible version without locking to one exact number.
+`>=3.0,<4.0` means *"any version from 3.0 up to (but not including)
+4.0"*. This ensures compatibility without locking to one exact number.
 
 ---
 
-## 4 — `app.py` — Imports
+## 5 — `app.py` — Imports
 
 ```python
-import atexit                                  # Line 23
-import cv2                                     # Line 24
-from flask import Flask, Response, render_template  # Line 25
-from picamera2 import Picamera2                # Line 26
-from ultralytics import YOLO                   # Line 27
+import atexit                            # Line 23
+
+import cv2                               # Line 25
+import numpy as np                       # Line 26
+from flask import Flask, Response, render_template   # Line 27
+from picamera2 import Picamera2          # Line 28
 ```
 
 ### What is `import`?
 
 Python code is organized into **modules** (files) and **packages**
-(folders of files). `import` tells Python: *"Go find this other file
-and make its code available to me."*
+(folders of files). `import` means: *"Go find this other file and make
+its tools available to me."*
 
 ### Each import explained
 
 | Import | What it gives us | Where it comes from |
 |---|---|---|
-| `atexit` | A way to register "run this function when the program exits" | Python's standard library (built in, always available) |
-| `cv2` | OpenCV's Python interface — image manipulation, drawing, encoding | The `opencv-python-headless` pip package |
-| `Flask` | A class that *is* the web server — you create an instance of it | The `flask` pip package |
-| `Response` | A class that represents an HTTP response — we use it to build the streaming reply | Same `flask` package |
-| `render_template` | A function that reads an HTML file from `templates/`, fills in any variables, and returns the result as a string | Same `flask` package |
+| `atexit` | Register "run this function when the program exits" | Python's standard library (always available) |
+| `cv2` | OpenCV's Python interface — image manipulation, neural-net inference, drawing, encoding | The `opencv-python-headless` pip package |
+| `numpy as np` | Fast array math — we use it to reshape the model's output tensor and find the highest class score | The `numpy` pip package. `as np` is an **alias** — lets us type `np.argmax()` instead of `numpy.argmax()` |
+| `Flask` | A class that *is* the web server | The `flask` pip package |
+| `Response` | A class for building HTTP responses — we use it for the streaming reply | Same `flask` package |
+| `render_template` | Reads an HTML file from `templates/` and returns it as a string | Same `flask` package |
 | `Picamera2` | A class that controls the physical camera hardware | Pre-installed system package on the Pi |
-| `YOLO` | A class that loads a YOLO AI model and can run detection on images | The `ultralytics` pip package |
 
 ### `from X import Y` vs `import X`
 
-- `import cv2` — imports the whole module; you access its contents
-  as `cv2.something`.
+- `import cv2` — imports the whole module; access its contents as
+  `cv2.something`.
 - `from flask import Flask` — reaches *into* the `flask` module and
-  grabs just the `Flask` name, so you can use it directly without the
-  `flask.` prefix.
+  grabs just the `Flask` name, so you can write `Flask(...)` directly
+  instead of `flask.Flask(...)`.
 
-Both are valid; the `from` style is just more convenient when you know
-exactly which pieces you need.
+### `import numpy as np`
+
+`as np` creates a shortcut name. `numpy` is 5 characters; `np` is 2.
+Since we type it a lot, the alias saves keystrokes. This is a near‑
+universal convention — almost every Python codebase calls NumPy `np`.
 
 ---
 
-## 5 — `app.py` — Configuration Constants
+## 6 — `app.py` — Configuration Constants
 
 ```python
-JPEG_QUALITY = 80         # Line 32
-FRAME_WIDTH  = 1280       # Line 33
-FRAME_HEIGHT = 720        # Line 34
+JPEG_QUALITY      = 80        # Line 33
+FRAME_WIDTH       = 1280      # Line 34
+FRAME_HEIGHT      = 720       # Line 35
+MODEL_INPUT_SIZE  = 640       # Line 36
+CONFIDENCE_THRESH = 0.50      # Line 37
+NMS_THRESH        = 0.40      # Line 38
+PERSON_CLASS_ID   = 0         # Line 39
 ```
 
 ### Why ALL_CAPS?
 
-In Python, writing a variable name in `ALL_CAPS` is a **convention**
-(not a rule the language enforces) that says: *"This is a constant —
-set it once and don't change it while the program runs."* It makes
-settings easy to find at the top of the file.
+A Python **convention** (not enforced by the language) meaning: *"This
+is a constant — set it once at the top of the file and don't change it
+while the program runs."*
 
-| Constant | Meaning |
-|---|---|
-| `JPEG_QUALITY = 80` | When we compress a frame to JPEG, use quality level 80 out of 100. Lower = smaller file = faster streaming but blurrier. Higher = bigger file = sharper but slower |
-| `FRAME_WIDTH = 1280` | We ask the camera for 1280 pixels wide (720p HD) |
-| `FRAME_HEIGHT = 720` | We ask the camera for 720 pixels tall |
+| Constant | Value | Meaning |
+|---|---|---|
+| `JPEG_QUALITY` | `80` | JPEG compression quality (1–100). 80 = good balance of sharpness vs. file size |
+| `FRAME_WIDTH` | `1280` | Camera capture width (720p HD) |
+| `FRAME_HEIGHT` | `720` | Camera capture height |
+| `MODEL_INPUT_SIZE` | `640` | YOLO models are trained on 640×640 images. We must resize every frame to this size before feeding it to the network |
+| `CONFIDENCE_THRESH` | `0.50` | Only draw a box if the AI is ≥ 50% confident. Prevents jittery false positives |
+| `NMS_THRESH` | `0.40` | Overlap threshold for Non-Maximum Suppression (explained later). If two boxes overlap by more than 40%, keep only the stronger one |
+| `PERSON_CLASS_ID` | `0` | In the COCO dataset YOLO was trained on, class 0 = "person". There are 80 classes total (car, dog, chair…) — we only care about people |
 
 ---
 
-## 6 — `app.py` — Camera Initialisation
+## 7 — `app.py` — Camera Initialisation
 
 ```python
-picam2 = Picamera2()                                          # Line 39
+picam2 = Picamera2()                                          # Line 44
 
-config = picam2.create_video_configuration(                   # Line 43
+config = picam2.create_video_configuration(                   # Line 46
     main={"format": "BGR888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
 )
-picam2.configure(config)                                      # Line 46
-picam2.start()                                                # Line 47
+picam2.configure(config)                                      # Line 49
+picam2.start()                                                # Line 50
 ```
-
-Let's break this down statement by statement:
 
 ### `picam2 = Picamera2()`
 
-This creates a **camera object** — a chunk of code that knows how to
-talk to the Arducam hardware. The trailing `()` means "call the
-constructor" (the function that creates a new instance). Think of it
-like pressing the "on" button.
-
-After this line, `picam2` is a variable pointing to that camera object.
-You'll use this variable everywhere you want to interact with the camera.
+Creates a **camera object** — a chunk of code that talks to the Arducam
+hardware. The trailing `()` calls the **constructor** (the special
+function that creates a new instance). Think of it as pressing the "on"
+button.
 
 ### `create_video_configuration(...)`
 
-This builds a **settings dictionary** that tells the camera *how* to
-deliver frames:
+Builds a settings dictionary:
 
 ```python
 main={"format": "BGR888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
 ```
 
-- **`main={...}`** — configures the main (full-resolution) output
-  stream. Picamera2 supports secondary streams too, but we only need one.
-- **`"format": "BGR888"`** — tells the camera hardware's ISP (Image
-  Signal Processor) to output each pixel as three bytes:
-  **B**lue, **G**reen, **R**ed. This is the colour order OpenCV expects.
-  "888" means 8 bits per channel = 256 brightness levels per colour.
-- **`"size": (1280, 720)`** — the resolution tuple (width, height).
+- **`main={...}`** — configures the primary output stream.
+- **`"format": "BGR888"`** — each pixel is three bytes: **B**lue,
+  **G**reen, **R**ed. This is the colour order OpenCV expects.
+  "888" = 8 bits per channel = 256 brightness levels per colour.
+- **`"size": (1280, 720)`** — the resolution as a **tuple**
+  (width, height).
 
-### `picam2.configure(config)`
+### `picam2.configure(config)` / `picam2.start()`
 
-Applies those settings to the hardware. The camera driver now knows what
-format and resolution we want.
+`.configure()` applies the settings to the hardware driver.
+`.start()` begins continuous capture — the camera's ISP now constantly
+fills a buffer in memory with fresh frames.
 
-### `picam2.start()`
-
-Begins continuous capture. From this moment on, the camera's ISP is
-constantly filling a buffer in memory with fresh frames. We haven't
-*read* any frames yet — we've just told the camera to start producing
-them.
-
-### `print(f"[camera] ...")`
+### The `print(f"...")` line
 
 ```python
 print(f"[camera] Picamera2 started  "
       f"resolution={FRAME_WIDTH}×{FRAME_HEIGHT}  format=BGR888")
 ```
 
-This prints a startup message to the terminal. The `f"..."` is an
-**f-string** — a Python feature where anything inside `{braces}` gets
-replaced with its value. So `{FRAME_WIDTH}` becomes `1280`.
+Prints a startup message. The `f"..."` is an **f-string** — anything
+inside `{braces}` gets replaced with the variable's value. So
+`{FRAME_WIDTH}` becomes `1280`.
 
 ---
 
-## 7 — `app.py` — YOLO Model Loading
+## 8 — `app.py` — YOLO Model Loading (cv2.dnn)
 
 ```python
-MODEL_PATH       = "yolo11n_ncnn_model"       # Line 55
-CONFIDENCE_THRESH = 0.50                      # Line 56
-PERSON_CLASS_ID   = 0                         # Line 57
+MODEL_PATH = "yolo11n.onnx"                   # Line 58
 
-model = YOLO(MODEL_PATH)                      # Line 59
+net = cv2.dnn.readNetFromONNX(MODEL_PATH)      # Line 60
 ```
 
-### What each constant means
+### What is ONNX?
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `MODEL_PATH` | `"yolo11n_ncnn_model"` | The folder on disk containing the exported YOLO model files. The `n` in `yolo11n` means "nano" — the smallest/fastest variant, ideal for the Pi's limited CPU |
-| `CONFIDENCE_THRESH` | `0.50` | Only draw a box if the AI is at least 50% confident it sees a person. Prevents flicker from uncertain guesses |
-| `PERSON_CLASS_ID` | `0` | In the COCO dataset (the training data YOLO learned from), class ID 0 is "person". There are 80 classes total (car, dog, chair, etc.) — we only care about people |
+**ONNX** (Open Neural Network Exchange) is a universal file format for
+AI models. You can export a model from any framework (PyTorch,
+TensorFlow, etc.) into a `.onnx` file, and any compatible runtime can
+load and run it. Think of it like a `.pdf` — one file format, many
+readers.
 
-### `model = YOLO(MODEL_PATH)`
+### What is `cv2.dnn`?
 
-This line does a **lot** of heavy lifting:
-1. Reads the model weights and architecture from the `yolo11n_ncnn_model/` folder
-2. Loads them into memory
-3. Prepares the ncnn inference engine (a lightweight neural-network
-   runtime optimised for ARM CPUs like the Pi's)
+OpenCV has a built-in **DNN (Deep Neural Network)** module that can
+load and execute neural network models without needing PyTorch or
+TensorFlow. Its C++ backend checks what CPU instructions are available
+at runtime, so it won't crash on older hardware like the Pi 4.
 
-We do this **once, at startup** rather than per-frame, because loading a
-model takes seconds and uses significant memory. Reloading it every
-frame would crash the Pi.
+### `net = cv2.dnn.readNetFromONNX(MODEL_PATH)`
+
+This reads the entire YOLO11n model from the `.onnx` file and loads it
+into memory. After this line, `net` is a neural-network object we can
+feed images into and get detection results out.
+
+We do this **once at startup** because loading takes seconds and uses
+significant memory. If we reloaded it per-frame, the Pi would crash.
 
 ### Why is this outside any function?
 
-Code at the "top level" of a Python file (not indented inside a
-`def` or `class`) runs **once** when the file is first executed. That's
-exactly what we want: load the model once, reuse it forever.
+Code at the "top level" of a Python file (not indented inside a `def`
+or `class`) runs **once** when the file is first executed. That's
+exactly what we want.
 
 ---
 
-## 8 — `app.py` — Camera Cleanup (`atexit`)
+## 9 — `app.py` — Camera Cleanup (`atexit`)
 
 ```python
-def _release_camera() -> None:                 # Line 67
+def _release_camera() -> None:                 # Line 68
     try:
         picam2.stop()
         picam2.close()
@@ -271,70 +307,79 @@ def _release_camera() -> None:                 # Line 67
     except Exception:
         pass
 
-atexit.register(_release_camera)               # Line 80
+atexit.register(_release_camera)               # Line 78
 ```
 
 ### Why we need this
 
-The camera is a **physical device**. Only one program at a time can use
-it. If our program crashes without telling the camera "I'm done", the
-Pi's kernel still thinks the camera is in use. You'd have to reboot.
-This cleanup code prevents that.
+The camera is a **physical device** — only one program can use it at a
+time. If our program crashes without releasing it, the Pi's kernel
+thinks the camera is busy. You'd have to reboot. This cleanup prevents
+that.
 
-### Line-by-line breakdown
+### Syntax breakdown
 
-#### `def _release_camera() -> None:`
+| Code | Meaning |
+|---|---|
+| `def _release_camera()` | Defines a function. Leading `_` = convention for "private/internal" |
+| `-> None` | **Type hint**: this function returns nothing. Documentation only — doesn't change behaviour |
+| `try:` | "Try executing this code…" |
+| `except Exception:` | "…but if anything goes wrong, catch the error and…" |
+| `pass` | "…do nothing." (We're shutting down anyway, so no useful action to take) |
+| `picam2.stop()` | Stops the ISP from producing frames |
+| `picam2.close()` | Releases the hardware device entirely |
+| `atexit.register(...)` | "When Python exits (for any reason), call this function first" |
 
-- **`def`** — defines a new function.
-- **`_release_camera`** — the function's name. The leading underscore
-  `_` is a Python convention meaning *"this is private / internal — not
-  meant to be called from outside this file"*.
-- **`() -> None`** — this function takes **no arguments** and returns
-  **nothing** (`None`). The `-> None` is a **type hint** — it doesn't
-  change behaviour, it's just documentation for humans reading the code.
+### Why no parentheses?
 
-#### `try: ... except Exception: pass`
-
-This is Python's **error handling** syntax:
-
-```
-try:
-    # code that might fail
-except Exception:
-    # what to do if it fails
-    pass          ← "do nothing, just ignore the error"
+```python
+atexit.register(_release_camera)     # ← no ()
 ```
 
-Why ignore errors here? If the camera was never started, or was already
-closed, calling `.stop()` would crash. But we're shutting down anyway,
-so there's nothing useful we can do with the error. `pass` means
-"carry on silently".
-
-#### `picam2.stop()` and `picam2.close()`
-
-- `.stop()` — tells the ISP to stop producing frames.
-- `.close()` — releases the hardware device entirely, freeing the
-  kernel lock.
-
-#### `atexit.register(_release_camera)`
-
-**`atexit.register()`** says: *"When the Python interpreter is about to
-exit — for any reason — call this function first."*
-
-Notice we pass `_release_camera` **without parentheses**. We're handing
-the function itself to `atexit`, not calling it. `atexit` stores it and
-calls it later at exit time.
+We pass the function **itself** as a reference, not the result of
+calling it. `atexit` stores the reference and calls it later at exit.
 
 | Syntax | Meaning |
 |---|---|
 | `_release_camera()` | **Call** the function right now |
-| `_release_camera` | **Reference** the function object (don't call it yet) |
+| `_release_camera` | **Reference** the function object (don't call it) |
 
 ---
 
-## 9 — `app.py` — `process_frame()` (the brain)
+## 10 — `app.py` — Scale Factors
 
-This is the most complex function. Let's take it section by section.
+```python
+_sx = FRAME_WIDTH  / MODEL_INPUT_SIZE   # 1280 / 640 = 2.0
+_sy = FRAME_HEIGHT / MODEL_INPUT_SIZE   # 720  / 640 = 1.125
+```
+
+### The problem these solve
+
+The YOLO model sees a 640×640 image. But our camera produces 1280×720
+frames. When the model says "there's a person at x=200 in the 640×640
+image", we need to translate that back to x=400 in the 1280-pixel-wide
+real frame.
+
+`_sx = 2.0` means "multiply every horizontal coordinate by 2".
+`_sy = 1.125` means "multiply every vertical coordinate by 1.125".
+
+### Why precompute?
+
+These values never change — the resolution is fixed. Computing them
+once outside the function (rather than 8,400 times per frame inside
+the loop) is a tiny speed optimization.
+
+### Why the leading underscore?
+
+Same convention as `_release_camera`: the `_` prefix signals "this
+is an internal/private variable, not meant to be part of the public
+API".
+
+---
+
+## 11 — `app.py` — `process_frame()` — The Brain
+
+This is the most complex function. Let's go through every step.
 
 ### Function signature
 
@@ -342,12 +387,13 @@ This is the most complex function. Let's take it section by section.
 def process_frame(frame):
 ```
 
-Takes one argument: `frame`, which is a **NumPy array** — a giant 3D
-grid of numbers representing pixel colours. Its shape is
-`(720, 1280, 3)`:
-- 720 rows of pixels (height)
-- 1280 columns of pixels (width)
-- 3 colour values per pixel (Blue, Green, Red — 0 to 255 each)
+Takes one argument: `frame`, a **NumPy array** — a giant 3D grid of
+numbers representing pixel colours. Shape: `(720, 1280, 3)`:
+- 720 rows (height)
+- 1280 columns (width)
+- 3 colour values per pixel (0–255 each)
+
+---
 
 ### Step 1 — Colour Fix
 
@@ -355,128 +401,273 @@ grid of numbers representing pixel colours. Its shape is
 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 ```
 
-**The problem:** Even though we asked for `BGR888`, the Picamera2
-hardware actually delivers pixels in **RGB** order (Red, Green, Blue).
-OpenCV **expects** BGR (Blue, Green, Red). If you skip this conversion,
-reds and blues swap — you look like a Smurf.
+**The problem:** Even though we asked for `BGR888`, Picamera2 actually
+delivers pixels in **RGB** order. OpenCV expects **BGR**. Without this
+swap, reds and blues flip — you look like a Smurf.
 
-**`cv2.cvtColor()`** is OpenCV's "convert colour" function:
-- First argument: the source image
-- Second argument: a constant describing the conversion.
-  `cv2.COLOR_RGB2BGR` means *"swap the Red and Blue channels"*.
+`cv2.cvtColor()` = "convert colour". `cv2.COLOR_RGB2BGR` = "swap the
+Red and Blue channels". It modifies every pixel in the array: pixel
+`[R, G, B]` becomes `[B, G, R]`.
 
-The result overwrites `frame` with the corrected version.
+---
 
-### Step 2 — YOLO Inference
+### Step 2 — Blob Creation
 
 ```python
-results = model(frame, verbose=False)
+blob = cv2.dnn.blobFromImage(
+    frame, 1 / 255.0, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
+    swapRB=False, crop=False,
+)
 ```
 
-This single line runs the entire neural network on the image:
-1. Resizes the frame to the model's internal input size (usually 640×640)
-2. Feeds it through all the neural-network layers
-3. Produces a list of **detections**: each detection has a class ID
-   (what object), a confidence score (how sure), and bounding-box
-   coordinates (where in the image)
+Neural networks can't eat raw images. They need a specific input
+format called a **blob**. `blobFromImage` does three things at once:
 
-`verbose=False` prevents YOLO from printing timing stats for every
-single frame (which floods the terminal).
+| Argument | What it does |
+|---|---|
+| `frame` | The input image (1280×720, BGR, pixels from 0–255) |
+| `1 / 255.0` | **Scale factor** — divides every pixel value by 255, normalising them to the 0.0–1.0 range. Neural networks work better with small numbers |
+| `(640, 640)` | **Resize** the image to 640×640 pixels (what YOLO expects) |
+| `swapRB=False` | Don't swap Red/Blue — we already fixed the channels in step 1 |
+| `crop=False` | Stretch the image to fit 640×640, don't crop the edges |
 
-`results` is a **list**. Usually it has one element per image you passed
-in (we passed one image, so it's a list of length 1).
+The output `blob` is a 4D array with shape `(1, 3, 640, 640)`:
+- `1` — batch size (one image)
+- `3` — colour channels (B, G, R)
+- `640, 640` — width and height
 
-### Step 3–4 — Filtering and Drawing
+This shape is what all modern neural-net frameworks expect: **NCHW**
+(batch-**N**, **C**hannels, **H**eight, **W**idth).
+
+---
+
+### Step 3 — Forward Pass
 
 ```python
-for result in results:
-    for box in result.boxes:
-        cls_id = int(box.cls[0])
-        conf   = float(box.conf[0])
+net.setInput(blob)
+outputs = net.forward()          # shape: [1, 84, 8400]
 ```
 
-#### The outer loop: `for result in results:`
+**`net.setInput(blob)`** — loads the blob into the network's input slot.
 
-Iterates over each result (we only have one image, so this loop runs
-once). A `for` loop in Python says *"for each item in this collection,
-do the following"*.
+**`net.forward()`** — runs the **forward pass**: pushes the input
+through all ~80 layers of the neural network (convolutions, activations,
+pooling, etc.) and collects the output. This is where the actual "AI
+thinking" happens. On a Pi 4 this takes roughly 200–500ms.
 
-#### The inner loop: `for box in result.boxes:`
+The output shape is `[1, 84, 8400]`:
+- `1` — batch size (one image)
+- `84` — 4 bounding-box values + 80 class scores
+- `8400` — the number of candidate detections the model generates
+  (grid cells at multiple scales)
 
-`result.boxes` contains all detected objects in the frame. Each `box` is
-one detection. If YOLO found 3 people and a dog, there would be 4 boxes.
+---
 
-#### Extracting class and confidence
+### Step 4 — Tensor Parsing
 
 ```python
-cls_id = int(box.cls[0])     # e.g., 0 = person, 16 = dog
-conf   = float(box.conf[0])  # e.g., 0.87 = 87% confident
+preds = outputs[0].T             # shape: [8400, 84]
 ```
 
-- `box.cls` is a tensor (a fancy array) containing the class ID. `[0]`
-  grabs the first (and only) value. `int()` converts it from a tensor
-  to a plain Python integer.
-- `box.conf` is a tensor of the confidence score. `float()` converts it
-  to a plain Python decimal number.
+The raw output is awkwardly shaped for iteration. We fix it:
+
+1. **`outputs[0]`** — strips the batch dimension: `[1, 84, 8400]` →
+   `[84, 8400]`
+2. **`.T`** — **transpose** (flip rows and columns): `[84, 8400]` →
+   `[8400, 84]`
+
+Now each **row** is one candidate detection, and each row looks like:
+
+```
+index:  0          1          2       3       4       5       ... 83
+value:  x_center   y_center   width   height  person  bicycle ... toothbrush
+        ────────── ────────── ─────── ─────── ─────── ─────── ─── ──────────
+        bounding box (640-space)      ← 80 class confidence scores →
+```
+
+There are 8,400 rows — most are garbage (low confidence). The next
+step filters them.
+
+---
+
+### Steps 5–6 — Filtering + NMS
+
+```python
+boxes = []
+confidences = []
+
+for row in preds:
+    class_scores = row[4:]
+    class_id = int(np.argmax(class_scores))
+    conf = float(class_scores[class_id])
+
+    if class_id != PERSON_CLASS_ID or conf < CONFIDENCE_THRESH:
+        continue
+
+    cx, cy, w, h = row[0], row[1], row[2], row[3]
+    x = int((cx - w / 2) * _sx)
+    y = int((cy - h / 2) * _sy)
+    w = int(w * _sx)
+    h = int(h * _sy)
+
+    boxes.append([x, y, w, h])
+    confidences.append(conf)
+
+indices = cv2.dnn.NMSBoxes(boxes, confidences,
+                           CONFIDENCE_THRESH, NMS_THRESH)
+```
+
+This is dense. Let's unpack every line:
+
+#### `boxes = []` and `confidences = []`
+
+Create two empty **lists**. We'll fill them with valid detections as we
+loop.
+
+#### `for row in preds:`
+
+Loop through all 8,400 candidate detections.
+
+#### `class_scores = row[4:]`
+
+**Array slicing**: `row[4:]` means "give me everything from index 4
+onward". Indices 0–3 are the bounding box; indices 4–83 are the 80
+class scores. So `class_scores` is an array of 80 numbers.
+
+#### `class_id = int(np.argmax(class_scores))`
+
+`np.argmax()` finds the **index** of the highest value in the array.
+If the "person" score is the highest, this returns `0`. If "dog" is
+highest, it returns `16`. We wrap it in `int()` to convert from a NumPy
+integer to a plain Python integer.
+
+#### `conf = float(class_scores[class_id])`
+
+Looks up the actual score at that index. For example, if `class_id` is
+`0` and `class_scores[0]` is `0.87`, then `conf = 0.87` (87% confident
+it's a person).
 
 #### The filter
 
 ```python
-if cls_id != PERSON_CLASS_ID or conf < CONFIDENCE_THRESH:
+if class_id != PERSON_CLASS_ID or conf < CONFIDENCE_THRESH:
     continue
 ```
 
-**`continue`** means *"skip the rest of this loop iteration and move on
-to the next box"*. So if the detected object isn't a person (`!= 0`),
-or if the confidence is below 50% (`< 0.50`), we ignore it completely.
+`continue` = *"skip the rest of this loop iteration, move to the next
+row"*. We skip if:
+- The top class isn't "person" (`!= 0`), **or**
+- The confidence is below 50% (`< 0.50`)
 
-The `!=` operator means "not equal to". The `or` keyword means "if
-either condition is true".
+This eliminates the vast majority of the 8,400 rows.
 
-#### Extracting coordinates
+#### Coordinate conversion
 
 ```python
-x1, y1, x2, y2 = map(int, box.xyxy[0])
+cx, cy, w, h = row[0], row[1], row[2], row[3]
+x = int((cx - w / 2) * _sx)
+y = int((cy - h / 2) * _sy)
+w = int(w * _sx)
+h = int(h * _sy)
 ```
 
-This is dense — let's unpack it:
+The model outputs boxes as **(centre-x, centre-y, width, height)** in
+640×640 space. We need **(top-left-x, top-left-y, width, height)** in
+1280×720 space:
 
-- `box.xyxy[0]` — the bounding box coordinates in
-  **(x1, y1, x2, y2)** format:
+```
+640×640 model space              1280×720 real frame
+┌────────────────────┐           ┌─────────────────────────────────┐
+│          (cx,cy)   │           │                                 │
+│         ○          │    ×_sx   │         (x,y)──────────┐        │
+│      ┌──┼──┐       │   ×_sy   │           │            │        │
+│      │  │  │       │  ──────▶ │           │   PERSON   │        │
+│      └──┴──┘       │           │           │            │        │
+│        w,h         │           │           └────────────┘        │
+└────────────────────┘           │             w*_sx, h*_sy        │
+                                 └─────────────────────────────────┘
+```
 
-  ```
-  (x1, y1) ────────────────┐
-       │                    │
-       │     PERSON         │
-       │                    │
-       └────────────────── (x2, y2)
-  ```
+- `cx - w/2` converts centre-x to **left edge** x.
+- `cy - h/2` converts centre-y to **top edge** y.
+- Multiplying by `_sx` and `_sy` scales from 640-space to native space.
+- `int(...)` rounds to whole pixels.
 
-  `x1, y1` = top-left corner. `x2, y2` = bottom-right corner. These are
-  pixel coordinates (e.g. x1=200, y1=50, x2=400, y2=600).
+#### `boxes.append(...)` / `confidences.append(...)`
 
-- `map(int, ...)` — applies `int()` to each of the four values,
-  converting them from floating-point tensors to plain integers (you need
-  integers for pixel coordinates — there's no pixel 200.7).
+`.append()` adds an item to the end of a list.
 
-- `x1, y1, x2, y2 = ...` — **tuple unpacking**: Python lets you assign
-  multiple variables at once from a collection. The four values pop out
-  into four separate variables.
+#### Non-Maximum Suppression (NMS)
+
+```python
+indices = cv2.dnn.NMSBoxes(boxes, confidences,
+                           CONFIDENCE_THRESH, NMS_THRESH)
+```
+
+**The problem NMS solves:** YOLO often generates multiple overlapping
+boxes for the same person — e.g. five boxes all surrounding your face,
+each from a different grid cell. NMS keeps only the **strongest** one
+and eliminates boxes that overlap it by more than `NMS_THRESH` (40%).
+
+Visually:
+
+```
+Before NMS:                    After NMS:
+┌──────────┐                   ┌──────────┐
+│┌────────┐│                   │          │
+││┌──────┐││                   │  PERSON  │
+│││PERSON │││   ──────▶        │   92%    │
+││└──────┘││                   │          │
+│└────────┘│                   └──────────┘
+└──────────┘
+  92%, 88%, 85%                  92% (winner)
+```
+
+`indices` is a list of which items in `boxes` survived the suppression.
+
+---
+
+### Step 7 — Annotation
+
+```python
+for i in indices:
+    idx = int(i) if isinstance(i, (int, np.integer)) else int(i[0])
+    x, y, w, h = boxes[idx]
+    conf = confidences[idx]
+```
+
+#### The `isinstance` check
+
+Different OpenCV versions return `indices` in different formats — either
+a plain `int` or a 1-element array `[int]`. This line handles both:
+
+```python
+idx = int(i) if isinstance(i, (int, np.integer)) else int(i[0])
+```
+
+This is a **ternary expression** (Python's inline if/else):
+
+```
+value_if_true  if  condition  else  value_if_false
+```
+
+If `i` is already an integer, use it directly. Otherwise, grab the
+first element with `i[0]`.
 
 #### Drawing the rectangle
 
 ```python
-cv2.rectangle(frame, (x1, y1), (x2, y2),
+cv2.rectangle(frame, (x, y), (x + w, y + h),
               color=(0, 255, 0), thickness=2)
 ```
 
-- `cv2.rectangle()` draws a rectangle directly onto the `frame` array
-  (modifying it in place).
-- `(x1, y1)` — top-left corner.
-- `(x2, y2)` — bottom-right corner.
-- `color=(0, 255, 0)` — colour in BGR format:
-  B=0, G=255, R=0 = **bright green**.
-- `thickness=2` — the line is 2 pixels wide.
+| Argument | Meaning |
+|---|---|
+| `frame` | The image to draw on (modified in place) |
+| `(x, y)` | Top-left corner of the box |
+| `(x + w, y + h)` | Bottom-right corner (top-left + width/height) |
+| `(0, 255, 0)` | Colour in BGR: B=0, G=255, R=0 = **bright green** |
+| `thickness=2` | Line width in pixels |
 
 #### Drawing the confidence label
 
@@ -484,46 +675,43 @@ cv2.rectangle(frame, (x1, y1), (x2, y2),
 label = f"Person {conf:.0%}"
 ```
 
-An f-string with a **format spec**: `{conf:.0%}` means "take `conf`
-(e.g. 0.87), multiply by 100, round to 0 decimal places, and add a `%`
-sign". Result: `"Person 87%"`.
+An f-string with a **format specifier**: `{conf:.0%}` means:
+1. Take `conf` (e.g. `0.87`)
+2. Multiply by 100 → `87`
+3. Round to 0 decimal places → `87`
+4. Append `%` → `87%`
+
+Result: `"Person 87%"`
 
 ```python
 (tw, th), baseline = cv2.getTextSize(
-    label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+    label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2,
 )
 ```
 
-`getTextSize()` measures how many pixels the text will take up *before*
-we draw it. Returns:
-- `(tw, th)` — text width and height in pixels
-- `baseline` — extra space below the text baseline (we don't use it)
+Measures how big the text will be **before drawing it** (in pixels).
+We need this to draw a background rectangle behind the text so it's
+readable.
 
-We need these measurements to draw a filled background rectangle behind
-the text so it's readable against the video.
+- `tw, th` = text width and height
+- `baseline` = extra space below (unused)
 
 ```python
-cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw, y1),
+cv2.rectangle(frame, (x, y - th - 10), (x + tw, y),
               color=(0, 255, 0), thickness=-1)
 ```
 
-Draws a **filled** rectangle (`thickness=-1` means "fill it in, don't
-just outline it") in green, positioned just *above* the bounding box.
-This is the label's background.
+Draws a **filled** green rectangle (`thickness=-1` = fill) just above
+the bounding box. This is the label background.
 
 ```python
-cv2.putText(frame, label, (x1, y1 - 5),
+cv2.putText(frame, label, (x, y - 5),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6,
             (0, 0, 0), 2)
 ```
 
-Draws the text on top of that green rectangle:
-- `(x1, y1 - 5)` — position (slightly above the box's top edge)
-- `cv2.FONT_HERSHEY_SIMPLEX` — a simple sans-serif font built into
-  OpenCV
-- `0.6` — font scale (60% of the font's default size)
-- `(0, 0, 0)` — text colour: black (so it stands out on green)
-- `2` — thickness of the font strokes
+Draws the text on top in **black** `(0, 0, 0)` so it contrasts with
+the green background.
 
 #### Return
 
@@ -531,12 +719,12 @@ Draws the text on top of that green rectangle:
 return frame
 ```
 
-Hands back the annotated BGR frame to whoever called `process_frame()`.
-The frame now has green boxes and labels drawn on it.
+The frame now has green boxes and labels drawn on it. It goes back to
+`generate_frames()` for JPEG compression.
 
 ---
 
-## 10 — `app.py` — `generate_frames()` (the heartbeat)
+## 12 — `app.py` — `generate_frames()` (the heartbeat)
 
 ```python
 def generate_frames():
@@ -560,58 +748,37 @@ def generate_frames():
 
 A normal function runs, returns one value, and is done. A **generator**
 uses `yield` instead of `return`. Each time you ask it for the next
-value, it:
+value:
 
-1. Resumes from where it last `yield`ed
+1. It **resumes** from where it last `yield`ed
 2. Runs until it hits another `yield`
-3. Pauses and hands out that value
+3. **Pauses** and hands out that value
 
-Since our generator has `while True:` (an infinite loop), it never stops.
-Every time Flask needs the next chunk of data to send to the browser, it
-asks this generator, which captures one frame, processes it, encodes it,
-and yields it.
+Since there's a `while True:` (infinite loop), this generator never
+stops. Flask keeps asking for the next chunk, and it keeps yielding
+JPEG frames.
 
 ### Line by line
 
 #### `encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]`
 
-A list telling `cv2.imencode` which compression settings to use. It's a
-key-value pair in list form: the key is `IMWRITE_JPEG_QUALITY`, the
-value is `80`. Created once outside the loop so we don't rebuild it every
-frame.
-
-#### `while True:`
-
-Loop forever. This is intentional — we want to stream until the server
-is stopped.
+A key-value pair in list form telling `cv2.imencode` to use quality 80.
+Created once outside the loop to avoid rebuilding it every frame.
 
 #### `frame = picam2.capture_array()`
 
 Grabs the latest frame from the camera's buffer as a NumPy array. This
-is a **blocking call** — if the camera hasn't produced a new frame yet,
-it waits until one is ready.
-
-#### `frame = process_frame(frame)`
-
-Sends the frame through our processing pipeline (colour fix → YOLO →
-annotations). Returns the annotated BGR frame.
+is a **blocking call** — if no new frame is ready, it waits.
 
 #### `ok, buffer = cv2.imencode(".jpg", frame, encode_params)`
 
 Compresses the raw pixel array into JPEG format:
-- `".jpg"` — the target format
-- `frame` — the pixel array (720 × 1280 × 3 bytes = ~2.7 MB)
-- `encode_params` — JPEG quality 80
+- Input: `frame` — 720 × 1280 × 3 = ~2.7 MB of raw pixels
+- Output: `buffer` — ~50–100 KB of JPEG data
 
-Returns two values (**tuple unpacking** again):
-- `ok` — a boolean: `True` if encoding succeeded, `False` if it failed
-- `buffer` — the compressed JPEG data as a NumPy array of bytes
-  (typically ~50–100 KB — much smaller than the raw 2.7 MB)
-
-#### `if not ok: continue`
-
-If encoding failed for some reason, skip this frame and try the next
-one. `not` flips `True` to `False` and vice versa.
+Returns two values (**tuple unpacking**):
+- `ok` — `True` if encoding succeeded
+- `buffer` — the compressed bytes
 
 #### The `yield` block
 
@@ -624,34 +791,30 @@ yield (
 )
 ```
 
-This yields one MJPEG "chunk". Let's decode the syntax:
+**`b"..."`** — a **bytes literal**. HTTP transmits raw binary, not
+Unicode text.
 
-**`b"..."`** — a **bytes literal**. Regular strings in Python are
-Unicode text. Bytes literals are raw binary data, which is what HTTP
-transmits.
+**`\r\n`** — carriage return + line feed, the standard HTTP line ending.
 
-**`\r\n`** — a "carriage return + line feed", the standard line ending
-in HTTP. Think of it as "press Enter" in web protocol language.
+**`buffer.tobytes()`** — converts the NumPy byte array into plain
+Python `bytes` for concatenation.
 
-**`buffer.tobytes()`** — converts the NumPy byte array into a plain
-Python `bytes` object that we can concatenate with `+`.
-
-The full chunk, laid out visually:
+The full chunk, laid out:
 
 ```
 --frame\r\n                          ← "Here comes a new part"
-Content-Type: image/jpeg\r\n\r\n     ← "It's a JPEG image" + blank line
-[...87,000 bytes of JPEG data...]    ← The actual compressed image
+Content-Type: image/jpeg\r\n\r\n     ← "It's a JPEG" + blank line
+[...87,000 bytes of JPEG data...]    ← The actual image
 \r\n                                 ← End of this part
 ```
 
-The browser receives this, displays the JPEG, then waits for the next
-`--frame` boundary. When it arrives, the browser **replaces** the image.
-This happens ~15–30 times per second → looks like live video.
+The browser displays the JPEG, then waits for the next `--frame`.
+When it arrives, the browser **replaces** the image. This happens
+many times per second → live video.
 
 ---
 
-## 11 — `app.py` — Flask Routes (the web server)
+## 13 — `app.py` — Flask Routes (the web server)
 
 ### Creating the app
 
@@ -659,12 +822,11 @@ This happens ~15–30 times per second → looks like live video.
 app = Flask(__name__)
 ```
 
-- `Flask(...)` creates a new web-server application.
-- `__name__` is a special Python variable that equals the current
-  module's name (in this case, `"__main__"` since we're running the file
-  directly). Flask uses it to locate the `templates/` folder.
+`Flask(...)` creates a web-server application. `__name__` is a special
+Python variable holding the current module's name — Flask uses it to
+find the `templates/` folder.
 
-### What is `@app.route(...)`?
+### The `@app.route(...)` decorator
 
 ```python
 @app.route("/")
@@ -672,17 +834,12 @@ def index():
     return render_template("index.html")
 ```
 
-The `@` symbol is a **decorator** — a special syntax that wraps a
-function with extra behaviour. `@app.route("/")` tells Flask: *"When
-any browser visits the root URL (`/`), call this function and send its
-return value back as the HTTP response."*
+The `@` symbol is a **decorator** — special syntax that wraps a function
+with extra behaviour. `@app.route("/")` tells Flask: *"When a browser
+visits `/`, call this function and send back its return value."*
 
-- **`"/"`** — the root URL (homepage). If the Pi's IP is `192.168.1.42`,
-  then visiting `http://192.168.1.42:5000/` triggers this function.
-- **`render_template("index.html")`** — reads the file
-  `templates/index.html`, and returns it as a string.
-  Flask automatically looks
-  inside the `templates/` folder.
+`render_template("index.html")` reads `templates/index.html` and
+returns it as a string.
 
 ### The streaming route
 
@@ -695,25 +852,22 @@ def video_feed():
     )
 ```
 
-When a browser requests `/video_feed` (because the `<img>` tag's `src`
-points there), Flask calls `video_feed()` which returns a `Response`
-object:
+When a browser requests `/video_feed`, Flask returns a `Response`
+wrapping our generator:
 
-- **`generate_frames()`** — the generator function from above.
-  Flask calls `next()` on it repeatedly, sending each yielded chunk to
-  the browser.
-- **`mimetype="multipart/x-mixed-replace; boundary=frame"`** — an HTTP
-  header that tells the browser:
-  - `multipart` — "I'll be sending multiple parts."
-  - `x-mixed-replace` — "Each new part **replaces** the previous one."
-  - `boundary=frame` — "The string `--frame` separates the parts."
+- **`generate_frames()`** — the infinite generator. Flask calls `next()`
+  on it repeatedly, sending each yielded chunk.
+- **`mimetype="multipart/x-mixed-replace; boundary=frame"`** — tells
+  the browser:
+  - `multipart` — "Multiple parts coming"
+  - `x-mixed-replace` — "Each part **replaces** the previous one"
+  - `boundary=frame` — "Parts are separated by `--frame`"
 
-  This is what makes the browser **swap** images instead of stacking
-  them. It's the core trick that enables MJPEG streaming.
+This is the core trick that makes MJPEG work.
 
 ---
 
-## 12 — `app.py` — Entry Point (`if __name__ == "__main__"`)
+## 14 — `app.py` — Entry Point
 
 ```python
 if __name__ == "__main__":
@@ -725,46 +879,31 @@ if __name__ == "__main__":
 
 ### `if __name__ == "__main__":`
 
-Every Python file has a hidden variable called `__name__`. When you run
-a file **directly** (`python app.py`), Python sets `__name__` to the
-string `"__main__"`. When a file is **imported** by another file,
-`__name__` is set to the file's module name instead.
-
-This `if` block says: *"Only start the web server if someone ran this
-file directly. If someone just imported it, don't auto-start."*
+When you run `python app.py`, Python sets `__name__` to `"__main__"`.
+If this file were imported by another file, `__name__` would be the
+module name instead. This block says: *"Only start the server if
+someone ran this file directly."*
 
 ### `app.run(...)`
 
-Starts Flask's built-in web server:
-
 | Argument | Meaning |
 |---|---|
-|`host="0.0.0.0"` | Listen on **all** network interfaces. Without this, Flask only listens on `127.0.0.1` (localhost), which means only the Pi itself could see the page — no other device on the Wi-Fi could reach it |
-| `port=5000` | The "door number" in the IP address. Browsers will connect to `http://<pi-ip>:5000` |
-| `threaded=True` | Create a new **thread** for each incoming request. This lets multiple browser tabs or devices watch the stream simultaneously |
+| `host="0.0.0.0"` | Listen on **all** network interfaces — lets other devices on the Wi-Fi reach the stream |
+| `port=5000` | The port number. Browsers connect to `http://<pi-ip>:5000` |
+| `threaded=True` | Each request gets its own **thread**, so multiple browsers can watch at once |
 
 ### `try: ... finally:`
 
-```python
-try:
-    app.run(...)    # runs until you hit Ctrl-C or it crashes
-finally:
-    _release_camera()
-```
-
-`finally` is the guarantee block. No matter *how* `app.run()` ends —
-normal shutdown, Ctrl-C, crash, exception — the code inside `finally:`
-**always** runs. This is our safety net to release the camera hardware.
-
-This is the "belt-and-suspenders" approach: `atexit` is the belt,
-`finally` is the suspenders. Both do the same thing. If one fails, the
-other catches it.
+`finally` is the **guarantee block** — no matter how `app.run()` ends
+(Ctrl-C, crash, exception), the camera is always released. This is the
+"belt-and-suspenders" approach: `atexit` is the belt, `finally` is the
+suspenders.
 
 ---
 
-## 13 — `templates/index.html` (the web page)
+## 15 — `templates/index.html` (the web page)
 
-The functionally important line:
+The only functionally important line:
 
 ```html
 <img id="live-stream" src="/video_feed" alt="Live camera stream" />
@@ -772,72 +911,76 @@ The functionally important line:
 
 | Attribute | What it does |
 |---|---|
-| `id="live-stream"` | A unique name for this element (useful for JavaScript later) |
-| `src="/video_feed"` | Tells the browser to make a request to `/video_feed` — our MJPEG streaming route. The browser treats the response as the image source. Because the response is `multipart/x-mixed-replace`, the browser keeps swapping in new images |
-| `alt="Live camera stream"` | Text shown if the image can't load (accessibility) |
+| `src="/video_feed"` | Makes a request to our MJPEG route. Because the response is `multipart/x-mixed-replace`, the browser continuously swaps in new images |
+| `alt="..."` | Fallback text if the image can't load |
 
-Everything else in the HTML is styling:
-- Dark background (`#0b0f19`)
-- Gradient title text
-- A pulsing red "Live" badge using CSS `@keyframes` animation
-- Responsive sizing (`max-width: 90vw`, `max-height: 75vh`)
+Everything else is cosmetic: dark background, gradient title, pulsing
+red "Live" badge, responsive sizing.
 
 ---
 
-## 14 — How All the Pieces Connect
+## 16 — How All the Pieces Connect
 
-Here's the full data flow from camera sensor to browser pixel — in
-order, every single time a frame is streamed:
+Full data flow — every step, every time a frame is streamed:
 
 ```
- ① Camera sensor captures photons → raw Bayer data
+ ①  Camera sensor captures photons → raw Bayer data
                     │
- ② Picamera2's ISP converts Bayer → RGB pixel array (numpy)
+ ②  Picamera2 ISP converts Bayer → RGB pixel array (numpy)
                     │
- ③ generate_frames() calls picam2.capture_array()
+ ③  generate_frames() calls picam2.capture_array()
                     │
- ④ generate_frames() calls process_frame(frame)
-        │
-        ├─ ⑤ cv2.cvtColor: swap RGB → BGR
-        │
-        ├─ ⑥ model(frame): YOLO runs 80-layer neural network
-        │       → returns list of detections (class, confidence, box)
-        │
-        ├─ ⑦ Filter: keep only class 0 (person) with conf > 50%
-        │
-        ├─ ⑧ cv2.rectangle + cv2.putText: draw green boxes & labels
-        │
-        └─ ⑨ return annotated BGR frame
+ ④  generate_frames() calls process_frame(frame)
+         │
+         ├─ ⑤  cv2.cvtColor: swap RGB → BGR
+         │
+         ├─ ⑥  cv2.dnn.blobFromImage: resize 1280×720 → 640×640, normalise 0–1
+         │
+         ├─ ⑦  net.setInput + net.forward: run 80-layer neural network
+         │       → raw tensor [1, 84, 8400]
+         │
+         ├─ ⑧  Transpose → [8400, 84], loop rows, extract class + confidence
+         │
+         ├─ ⑨  Filter: keep only class 0 (person) with conf > 50%
+         │
+         ├─ ⑩  NMSBoxes: remove overlapping duplicate boxes
+         │
+         ├─ ⑪  Scale 640→1280/720, draw green boxes + "Person 87%" labels
+         │
+         └─ ⑫  return annotated BGR frame
                     │
- ⑩ cv2.imencode: compress BGR frame → JPEG bytes (~50-100 KB)
+ ⑬  cv2.imencode: compress BGR frame → JPEG bytes (~50–100 KB)
                     │
- ⑪ yield: wrap JPEG in MJPEG multipart boundary
+ ⑭  yield: wrap JPEG in MJPEG multipart boundary
                     │
- ⑫ Flask sends bytes over HTTP to the browser
+ ⑮  Flask sends bytes over HTTP to the browser
                     │
- ⑬ Browser <img> tag receives the JPEG, displays it, waits for next one
+ ⑯  Browser <img> tag receives JPEG, displays it, waits for next one
                     │
-          [loop back to ① — runs ~15-30 times per second]
+          [loop back to ① — runs continuously]
 ```
 
-### Timing on a Raspberry Pi 4B
+### Expected performance on Raspberry Pi 4B
 
 | Step | Approximate time |
 |---|---|
 | Camera capture | ~30 ms |
-| RGB→BGR conversion | ~2 ms |
-| YOLO inference (ncnn, 4-core ARM) | ~80–150 ms |
+| RGB→BGR | ~2 ms |
+| Blob creation + resize | ~5 ms |
+| YOLO forward pass (cv2.dnn, 4-core ARM) | ~200–500 ms |
+| Tensor parsing + NMS | ~5 ms |
 | Drawing + JPEG encoding | ~5 ms |
-| **Total per frame** | **~120–190 ms → about 5–8 FPS** |
+| **Total per frame** | **~250–550 ms → about 2–4 FPS** |
 
-5–8 FPS is typical for YOLO Nano on a Pi 4 without a GPU. It's not
-silky smooth, but it's "live" enough to be useful for person detection.
+2–4 FPS is typical for YOLO on a Pi 4 without a GPU or NPU. It's not
+silky smooth, but it updates fast enough to be useful for person
+detection and alerting.
 
 ---
 
-## 15 — How to Run It
+## 17 — How to Run It
 
-### First time setup (on the Pi)
+### First-time setup (on the Pi)
 
 ```bash
 # 1. Clone the repo
@@ -847,12 +990,12 @@ cd yolo-fun
 # 2. Install Python dependencies
 pip install -r requirements.txt
 
-# 3. Export the YOLO model to ncnn format (one-time step)
-python -c "
-from ultralytics import YOLO
-model = YOLO('yolo11n.pt')      # downloads the model weights (~6 MB)
-model.export(format='ncnn')     # creates yolo11n_ncnn_model/ folder
-"
+# 3. Get the YOLO model in ONNX format
+#    Option A: export on a machine that HAS ultralytics:
+#      python -c "from ultralytics import YOLO; YOLO('yolo11n.pt').export(format='onnx')"
+#      scp yolo11n.onnx pi@<pi-ip>:~/yolo-fun/
+#
+#    Option B: download a pre-exported yolo11n.onnx from the Ultralytics releases
 ```
 
 ### Running the server
@@ -865,53 +1008,61 @@ You should see:
 
 ```
 [camera] Picamera2 started  resolution=1280×720  format=BGR888
-[yolo]   loaded yolo11n_ncnn_model
+[yolo]   loaded yolo11n.onnx  (cv2.dnn / ONNX)
  * Running on all addresses (0.0.0.0)
  * Running on http://127.0.0.1:5000
 ```
 
 ### Viewing the stream
 
-1. Find the Pi's IP: run `hostname -I` (e.g. `192.168.1.42`)
+1. Find the Pi's IP: `hostname -I` (e.g. `192.168.1.42`)
 2. On any device on the same Wi-Fi, open a browser
 3. Go to `http://192.168.1.42:5000`
-4. You should see live video with green boxes around any people
+4. You should see live video with green boxes around people
 
 ### Stopping
 
-Press **Ctrl+C** in the terminal. The camera will release automatically.
+Press **Ctrl + C**. The camera releases automatically.
 
 ---
 
-## 16 — Glossary
+## 18 — Glossary
 
 | Term | Meaning |
 |---|---|
-| **atexit** | Python module that lets you register functions to run when the program exits |
-| **BGR** | Blue-Green-Red — the colour channel order OpenCV uses (opposite of RGB) |
-| **Bounding box** | A rectangle drawn around a detected object showing its location |
-| **bytes literal** | `b"hello"` — raw binary data in Python, as opposed to a text string |
-| **Class ID** | A number identifying what type of object YOLO detected (0 = person, 1 = bicycle, etc.) |
-| **Confidence score** | A 0.0–1.0 number representing how sure the AI is about a detection |
-| **COCO** | Common Objects in Context — the dataset (80 object types) YOLO was trained on |
-| **CSI** | Camera Serial Interface — the ribbon cable connecting the camera to the Pi |
+| **atexit** | Python module — register functions to run when the program exits |
+| **BGR** | Blue-Green-Red — OpenCV's colour channel order (opposite of RGB) |
+| **Blob** | A preprocessed 4D array (batch, channels, height, width) ready for neural-net input |
+| **Bounding box** | A rectangle drawn around a detected object |
+| **Bytes literal** | `b"hello"` — raw binary data, not Unicode text |
+| **Class ID** | Number identifying what YOLO detected (0 = person, 1 = bicycle, etc.) |
+| **COCO** | Common Objects in Context — the 80-class dataset YOLO was trained on |
+| **Confidence** | 0.0–1.0 score: how sure the AI is about a detection |
+| **CSI** | Camera Serial Interface — the ribbon cable connecting camera to Pi |
+| **cv2.dnn** | OpenCV's built-in neural-network inference engine (no PyTorch needed) |
 | **Decorator** | `@something` syntax that wraps a function with extra behaviour |
-| **f-string** | `f"text {variable}"` — Python string that embeds variable values |
-| **Flask** | A lightweight Python web-server framework |
-| **Frame** | A single still image from the camera. Many frames per second = video |
-| **Generator** | A function that uses `yield` to produce values one at a time in a loop |
-| **ISP** | Image Signal Processor — hardware on the Pi that converts raw sensor data into pixels |
-| **JPEG** | A compressed image format. Much smaller than raw pixels |
-| **libcamera** | The Linux camera framework that Picamera2 uses under the hood |
-| **MJPEG** | Motion JPEG — streaming video by sending a sequence of JPEGs over HTTP |
-| **ncnn** | A lightweight neural-network inference library optimised for ARM CPUs |
-| **NumPy array** | A grid of numbers in memory. Images are 3D arrays: height × width × 3 channels |
-| **OpenCV (cv2)** | Computer-vision library for image processing, drawing, and encoding |
-| **Picamera2** | The official Python library for Raspberry Pi cameras |
-| **Route** | A URL pattern (`/`, `/video_feed`) that Flask maps to a Python function |
-| **Tensor** | A multi-dimensional array used by AI frameworks (like a numpy array but for models) |
-| **Thread** | A lightweight parallel execution path — lets multiple requests run at once |
-| **Tuple unpacking** | `a, b = (1, 2)` — assigning multiple variables from a collection in one line |
-| **Type hint** | `-> None` or `frame: np.ndarray` — annotations that describe expected types (documentation only) |
-| **V4L2** | Video4Linux2 — a Linux kernel interface for cameras. We bypass it due to bugs |
-| **YOLO** | "You Only Look Once" — a family of fast AI object-detection models |
+| **f-string** | `f"text {variable}"` — Python string with embedded variable values |
+| **Flask** | Lightweight Python web-server framework |
+| **Forward pass** | Running input data through all layers of a neural network to get output |
+| **Frame** | A single still image from the camera |
+| **Generator** | A function using `yield` to produce values one at a time in a loop |
+| **IoU** | Intersection over Union — measures how much two boxes overlap (used in NMS) |
+| **ISP** | Image Signal Processor — hardware converting raw sensor data to usable pixels |
+| **JPEG** | Compressed image format. Much smaller than raw pixel data |
+| **libcamera** | Linux camera framework that Picamera2 uses internally |
+| **MJPEG** | Motion JPEG — streaming video as a sequence of JPEGs over HTTP |
+| **NCHW** | Tensor dimension order: batch-N, Channels, Height, Width |
+| **NMS** | Non-Maximum Suppression — algorithm to remove duplicate overlapping detections |
+| **NumPy** | Python library for fast numerical array operations |
+| **ONNX** | Open Neural Network Exchange — universal model file format |
+| **OpenCV (cv2)** | Computer-vision library for image processing and neural-net inference |
+| **Picamera2** | Official Python library for Raspberry Pi cameras |
+| **Route** | A URL pattern (`/`, `/video_feed`) mapped to a Python function |
+| **SIGILL** | Signal: Illegal Instruction — kernel kills a program that tries to run a CPU instruction the hardware doesn't support |
+| **Tensor** | A multi-dimensional array of numbers (the data format neural networks work with) |
+| **Thread** | Lightweight parallel execution path — lets multiple requests run at once |
+| **Transpose** | Flip rows and columns of a matrix (`.T`) |
+| **Tuple unpacking** | `a, b = (1, 2)` — assign multiple variables from a collection |
+| **Type hint** | `-> None` — annotation describing expected types (documentation only) |
+| **V4L2** | Video4Linux2 — Linux kernel camera interface (bypassed in our setup) |
+| **YOLO** | "You Only Look Once" — family of fast object-detection AI models |
