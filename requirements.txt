@@ -1,6 +1,9 @@
 # ---------- yolo-fun: MJPEG Streaming Server ----------
 # Tested on Raspberry Pi 4B / 64-bit Bookworm
 # Install with:  pip install -r requirements.txt
+#
+# NOTE: picamera2 is pre-installed system-wide on Raspberry Pi OS.
+#       Do NOT pip-install it — use the system package (apt: python3-picamera2).
 
 flask>=3.0,<4.0
 opencv-python-headless>=4.8,<5.0   # headless build — no GUI libs needed on Pi

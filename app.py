@@ -1,62 +1,71 @@
 """
 app.py — MJPEG streaming server for Raspberry Pi 4B + Arducam IMX708.
 
+Uses the native Picamera2 library for frame capture (bypasses the broken
+libcamerify + V4L2 pipeline) and OpenCV only for JPEG compression.
+
 Architecture
 ────────────
-  VideoCapture (CSI / /dev/video0)
-        │
-        ▼
+  Picamera2  (CSI → ISP → BGR888 numpy array)
+       │
+       ▼
   generate_frames()  ──▶  process_frame(frame)   ← YOLO hook (no-op for now)
-        │
-        ▼
+       │
+       ▼
   cv2.imencode(".jpg")
-        │
-        ▼
+       │
+       ▼
   HTTP multipart/x-mixed-replace  ──▶  Browser <img> tag
 """
 
 import atexit
 import cv2
 from flask import Flask, Response, render_template
+from picamera2 import Picamera2
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-CAMERA_INDEX = 0          # /dev/video0 — CSI camera via V4L2
 JPEG_QUALITY = 80         # 1-100; lower = smaller frames, higher = sharper
-FRAME_WIDTH  = 1280       # requested capture width  (camera may clamp)
-FRAME_HEIGHT = 720        # requested capture height (camera may clamp)
+FRAME_WIDTH  = 1280       # capture width
+FRAME_HEIGHT = 720        # capture height
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Camera initialisation
+# Camera initialisation  (Picamera2 — talks directly to libcamera, no V4L2)
 # ──────────────────────────────────────────────────────────────────────────────
-cap = cv2.VideoCapture(CAMERA_INDEX)
+picam2 = Picamera2()
 
-if not cap.isOpened():
-    raise RuntimeError(
-        f"Cannot open camera at index {CAMERA_INDEX}. "
-        "Is the CSI ribbon seated and the camera enabled in raspi-config?"
-    )
+# BGR888 keeps the frame natively compatible with OpenCV's colour space,
+# so cv2.imencode() works without any cvtColor conversion.
+config = picam2.create_video_configuration(
+    main={"format": "BGR888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
+)
+picam2.configure(config)
+picam2.start()
 
-# NOTE: We intentionally do NOT call cap.set() for FRAME_WIDTH / FRAME_HEIGHT.
-# On Raspberry Pi OS Bookworm the libcamerify wrapper passes resolution as a
-# JSON array internally; OpenCV's cap.set()/cap.get() trigger a fatal C++
-# assertion ('!isArray_' failed) when they encounter that array type.
-# Instead we let libcamera dictate the native hardware resolution.
-print(f"[camera] opened /dev/video{CAMERA_INDEX}  "
-      f"(native resolution — controlled by libcamerify)")
+print(f"[camera] Picamera2 started  "
+      f"resolution={FRAME_WIDTH}×{FRAME_HEIGHT}  format=BGR888")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hardware lifecycle — release the CSI camera on exit
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _release_camera() -> None:
-    """Release the V4L2 device so the kernel drops its lock on the CSI camera."""
-    if cap.isOpened():
-        cap.release()
+    """Stop and close the Picamera2 instance so the kernel frees the device."""
+    try:
+        picam2.stop()
+        picam2.close()
         print("[camera] released")
+    except Exception:
+        # If the camera was never started or already closed, ignore.
+        pass
 
 
 # Register the cleanup handler so the camera is freed on normal exit,
 # SIGTERM, or an unhandled exception that tears down the interpreter.
 atexit.register(_release_camera)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Frame processing pipeline
@@ -72,7 +81,7 @@ def process_frame(frame):
     Parameters
     ----------
     frame : numpy.ndarray
-        Raw BGR image captured by OpenCV (H×W×3, dtype uint8).
+        Raw BGR image captured by Picamera2 (H×W×3, dtype uint8).
 
     Returns
     -------
@@ -107,12 +116,8 @@ def generate_frames():
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
 
     while True:
-        success, frame = cap.read()
-
-        if not success:
-            # Transient read failure — skip this tick and retry.
-            # On a Pi this occasionally happens during thermal throttling.
-            continue
+        # Grab a BGR numpy array straight from the ISP — no V4L2 involved.
+        frame = picam2.capture_array()
 
         # Run the frame through the processing pipeline
         frame = process_frame(frame)
