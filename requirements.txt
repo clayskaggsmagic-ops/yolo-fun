@@ -7,3 +7,4 @@
 
 flask>=3.0,<4.0
 opencv-python-headless>=4.8,<5.0   # headless build — no GUI libs needed on Pi
+ultralytics>=8.3,<9.0              # YOLO11 inference engine
