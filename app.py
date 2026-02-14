@@ -55,7 +55,7 @@ print(f"[camera] Picamera2 started  "
 # ──────────────────────────────────────────────────────────────────────────────
 # YOLO model  (loaded once at startup via OpenCV's DNN module)
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_PATH = "yolo11n.onnx"
+MODEL_PATH = "yolov8n.onnx"
 
 net = cv2.dnn.readNetFromONNX(MODEL_PATH)
 print(f"[yolo]   loaded {MODEL_PATH}  (cv2.dnn / ONNX)")
