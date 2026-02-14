@@ -1,10 +1,14 @@
 # ---------- yolo-fun: MJPEG Streaming Server ----------
-# Tested on Raspberry Pi 4B / 64-bit Bookworm
+# Tested on Raspberry Pi 4B / 64-bit Bookworm / Python 3.13
 # Install with:  pip install -r requirements.txt
 #
 # NOTE: picamera2 is pre-installed system-wide on Raspberry Pi OS.
 #       Do NOT pip-install it — use the system package (apt: python3-picamera2).
+#
+# NOTE: We do NOT use ultralytics or torch. PyTorch >= 2.6 emits ARMv8.2
+#       instructions that cause SIGILL on the Pi 4's ARMv8.0 CPU.
+#       YOLO inference runs through OpenCV's cv2.dnn (ONNX) instead.
 
 flask>=3.0,<4.0
 opencv-python-headless>=4.8,<5.0   # headless build — no GUI libs needed on Pi
-ultralytics>=8.3,<9.0              # YOLO11 inference engine
+numpy>=1.26,<3.0                   # tensor parsing for cv2.dnn output

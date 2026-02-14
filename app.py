@@ -2,16 +2,16 @@
 app.py — MJPEG streaming server + YOLO11 Nano person detection
            for Raspberry Pi 4B + Arducam IMX708.
 
-Uses the native Picamera2 library for frame capture (bypasses the broken
-libcamerify + V4L2 pipeline), YOLO11n-ncnn for real-time person detection,
-and OpenCV for annotation + JPEG compression.
+Uses Picamera2 for frame capture, OpenCV's cv2.dnn module to run a
+YOLO11n ONNX model (no torch/ultralytics — safe on ARMv8.0), and
+Flask for MJPEG streaming.
 
 Architecture
 ────────────
   Picamera2  (CSI → ISP → RGB numpy array)
        │
        ▼
-  generate_frames()  ──▶  process_frame(frame)   ← RGB→BGR + YOLO detection
+  generate_frames()  ──▶  process_frame(frame)   ← RGB→BGR + YOLO via cv2.dnn
        │
        ▼
   cv2.imencode(".jpg")
@@ -21,25 +21,28 @@ Architecture
 """
 
 import atexit
+
 import cv2
+import numpy as np
 from flask import Flask, Response, render_template
 from picamera2 import Picamera2
-from ultralytics import YOLO
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-JPEG_QUALITY = 80         # 1-100; lower = smaller frames, higher = sharper
-FRAME_WIDTH  = 1280       # capture width
-FRAME_HEIGHT = 720        # capture height
+JPEG_QUALITY      = 80        # 1-100; JPEG compression quality
+FRAME_WIDTH       = 1280      # capture width  (pixels)
+FRAME_HEIGHT      = 720       # capture height (pixels)
+MODEL_INPUT_SIZE  = 640       # YOLO expects a 640×640 input blob
+CONFIDENCE_THRESH = 0.50      # minimum confidence to keep a detection
+NMS_THRESH        = 0.40      # IoU threshold for Non-Maximum Suppression
+PERSON_CLASS_ID   = 0         # COCO class 0 = person
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Camera initialisation  (Picamera2 — talks directly to libcamera, no V4L2)
 # ──────────────────────────────────────────────────────────────────────────────
 picam2 = Picamera2()
 
-# BGR888 keeps the frame natively compatible with OpenCV's colour space,
-# so cv2.imencode() works without any cvtColor conversion.
 config = picam2.create_video_configuration(
     main={"format": "BGR888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
 )
@@ -50,14 +53,12 @@ print(f"[camera] Picamera2 started  "
       f"resolution={FRAME_WIDTH}×{FRAME_HEIGHT}  format=BGR888")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# YOLO model  (loaded once at startup to avoid per-frame memory allocation)
+# YOLO model  (loaded once at startup via OpenCV's DNN module)
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_PATH       = "yolo11n_ncnn_model"    # path to the exported ncnn model dir
-CONFIDENCE_THRESH = 0.50                   # minimum confidence to draw a box
-PERSON_CLASS_ID   = 0                      # COCO class 0 = person
+MODEL_PATH = "yolo11n.onnx"
 
-model = YOLO(MODEL_PATH)
-print(f"[yolo]   loaded {MODEL_PATH}")
+net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+print(f"[yolo]   loaded {MODEL_PATH}  (cv2.dnn / ONNX)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,12 +72,9 @@ def _release_camera() -> None:
         picam2.close()
         print("[camera] released")
     except Exception:
-        # If the camera was never started or already closed, ignore.
         pass
 
 
-# Register the cleanup handler so the camera is freed on normal exit,
-# SIGTERM, or an unhandled exception that tears down the interpreter.
 atexit.register(_release_camera)
 
 
@@ -84,17 +82,24 @@ atexit.register(_release_camera)
 # Frame processing pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Pre-compute scale factors (640 → native resolution) once, not per-frame.
+_sx = FRAME_WIDTH  / MODEL_INPUT_SIZE   # horizontal scale
+_sy = FRAME_HEIGHT / MODEL_INPUT_SIZE   # vertical   scale
+
+
 def process_frame(frame):
     """
-    Fix the colour channel order, run YOLO person detection, and annotate.
+    Fix colour channels, run YOLO11n via cv2.dnn, and annotate persons.
 
     Steps
     -----
-    1. Convert RGB (Picamera2 native) → BGR (OpenCV native).
-    2. Run YOLO11n-ncnn inference on the BGR frame.
-    3. Filter for class 0 (person) with confidence > CONFIDENCE_THRESH.
-    4. Draw bounding boxes and confidence labels.
-    5. Return the annotated BGR frame (ready for cv2.imencode).
+    1. Convert RGB (Picamera2) → BGR (OpenCV).
+    2. Build a 640×640 normalised blob.
+    3. Forward-pass through the ONNX network.
+    4. Parse the [1, 84, 8400] output tensor.
+    5. Filter for class 0 (person) above CONFIDENCE_THRESH.
+    6. Apply Non-Maximum Suppression to remove duplicate boxes.
+    7. Scale coordinates back to 1280×720 and draw annotations.
 
     Parameters
     ----------
@@ -106,39 +111,78 @@ def process_frame(frame):
     numpy.ndarray
         Annotated BGR frame.
     """
-    # ── 1. Colour fix: Picamera2 outputs RGB, OpenCV expects BGR ──────────
+    # ── 1. Colour fix ────────────────────────────────────────────────────
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    # ── 2. Run YOLO inference (verbose=False silences per-frame logging) ──
-    results = model(frame, verbose=False)
+    # ── 2. Blob creation ─────────────────────────────────────────────────
+    #   • Scale pixel values to 0-1       (1/255.0)
+    #   • Resize to 640×640               (MODEL_INPUT_SIZE)
+    #   • swapRB=False — frame is already BGR
+    #   • crop=False   — letterbox / stretch, don't crop
+    blob = cv2.dnn.blobFromImage(
+        frame, 1 / 255.0, (MODEL_INPUT_SIZE, MODEL_INPUT_SIZE),
+        swapRB=False, crop=False,
+    )
 
-    # ── 3–4. Filter for persons and draw boxes ────────────────────────────
-    for result in results:
-        for box in result.boxes:
-            cls_id = int(box.cls[0])
-            conf   = float(box.conf[0])
+    # ── 3. Forward pass ──────────────────────────────────────────────────
+    net.setInput(blob)
+    outputs = net.forward()          # shape: [1, 84, 8400]
 
-            # Skip anything that isn't a person or is below threshold
-            if cls_id != PERSON_CLASS_ID or conf < CONFIDENCE_THRESH:
-                continue
+    # ── 4. Tensor parsing ────────────────────────────────────────────────
+    #   Squeeze batch dim → [84, 8400], then transpose → [8400, 84]
+    #   Each of the 8,400 rows is one candidate detection:
+    #     [x_center, y_center, width, height, cls0_score, cls1_score, … cls79_score]
+    preds = outputs[0].T             # shape: [8400, 84]
 
-            # Bounding-box corner coordinates (top-left, bottom-right)
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+    # ── 5-6. Filter + NMS ────────────────────────────────────────────────
+    boxes = []
+    confidences = []
 
-            # Draw the rectangle
-            cv2.rectangle(frame, (x1, y1), (x2, y2),
-                          color=(0, 255, 0), thickness=2)
+    for row in preds:
+        # row[0:4]  = bounding box (centre-x, centre-y, w, h) in 640-space
+        # row[4:84] = 80 class scores
+        class_scores = row[4:]
+        class_id = int(np.argmax(class_scores))
+        conf = float(class_scores[class_id])
 
-            # Draw the confidence label above the box
-            label = f"Person {conf:.0%}"
-            (tw, th), baseline = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-            )
-            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw, y1),
-                          color=(0, 255, 0), thickness=-1)  # filled bg
-            cv2.putText(frame, label, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 0, 0), 2)  # black text on green bg
+        if class_id != PERSON_CLASS_ID or conf < CONFIDENCE_THRESH:
+            continue
+
+        # Convert (cx, cy, w, h) in 640-space → (x, y, w, h) in native-space
+        cx, cy, w, h = row[0], row[1], row[2], row[3]
+        x = int((cx - w / 2) * _sx)
+        y = int((cy - h / 2) * _sy)
+        w = int(w * _sx)
+        h = int(h * _sy)
+
+        boxes.append([x, y, w, h])
+        confidences.append(conf)
+
+    # Non-Maximum Suppression: eliminate overlapping duplicates
+    indices = cv2.dnn.NMSBoxes(boxes, confidences,
+                               CONFIDENCE_THRESH, NMS_THRESH)
+
+    # ── 7. Annotation ───────────────────────────────────────────────────
+    for i in indices:
+        # `i` may be an int or a 1-element array, depending on OpenCV version
+        idx = int(i) if isinstance(i, (int, np.integer)) else int(i[0])
+        x, y, w, h = boxes[idx]
+        conf = confidences[idx]
+
+        # Green bounding box
+        cv2.rectangle(frame, (x, y), (x + w, y + h),
+                      color=(0, 255, 0), thickness=2)
+
+        # Confidence label with filled background
+        label = f"Person {conf:.0%}"
+        (tw, th), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2,
+        )
+        cv2.rectangle(frame, (x, y - th - 10), (x + tw, y),
+                      color=(0, 255, 0), thickness=-1)
+        cv2.putText(frame, label, (x, y - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 0, 0), 2)
 
     return frame
 
