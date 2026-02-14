@@ -38,15 +38,13 @@ if not cap.isOpened():
         "Is the CSI ribbon seated and the camera enabled in raspi-config?"
     )
 
-# Request the desired resolution (the driver will use the closest supported mode)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-# Log the resolution the driver actually gave us
-actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# NOTE: We intentionally do NOT call cap.set() for FRAME_WIDTH / FRAME_HEIGHT.
+# On Raspberry Pi OS Bookworm the libcamerify wrapper passes resolution as a
+# JSON array internally; OpenCV's cap.set()/cap.get() trigger a fatal C++
+# assertion ('!isArray_' failed) when they encounter that array type.
+# Instead we let libcamera dictate the native hardware resolution.
 print(f"[camera] opened /dev/video{CAMERA_INDEX}  "
-      f"resolution={actual_w}×{actual_h}")
+      f"(native resolution — controlled by libcamerify)")
 
 
 def _release_camera() -> None:
