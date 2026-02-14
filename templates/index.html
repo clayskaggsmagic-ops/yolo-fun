@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YOLO-Fun — Live Feed</title>
+  <style>
+    /* ── Reset & base ────────────────────────────────── */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+      background: #0b0f19;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Header ──────────────────────────────────────── */
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 1.2rem;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    /* ── Video container ─────────────────────────────── */
+    .feed-container {
+      position: relative;
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.06),
+        0 20px 60px rgba(0, 0, 0, 0.55);
+      background: #111827;
+    }
+
+    .feed-container img {
+      display: block;
+      max-width: 90vw;
+      max-height: 75vh;
+      object-fit: contain;
+    }
+
+    /* ── Live badge ──────────────────────────────────── */
+    .live-badge {
+      position: absolute;
+      top: 12px;
+      left: 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(6px);
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #f87171;
+    }
+
+    .live-badge .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f87171;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.4; transform: scale(0.75); }
+    }
+
+    /* ── Footer ──────────────────────────────────────── */
+    footer {
+      margin-top: 1.4rem;
+      font-size: 0.78rem;
+      color: #475569;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>YOLO-Fun &mdash; Live Camera Feed</h1>
+
+  <div class="feed-container">
+    <!-- The <img> continuously loads MJPEG frames from the /video_feed route -->
+    <img id="live-stream" src="/video_feed" alt="Live camera stream" />
+    <span class="live-badge"><span class="dot"></span> Live</span>
+  </div>
+
+  <footer>Raspberry Pi 4B &middot; Arducam IMX708 &middot; MJPEG over Wi-Fi</footer>
+
+</body>
+</html>

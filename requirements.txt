@@ -1,0 +1,6 @@
+# ---------- yolo-fun: MJPEG Streaming Server ----------
+# Tested on Raspberry Pi 4B / 64-bit Bookworm
+# Install with:  pip install -r requirements.txt
+
+flask>=3.0,<4.0
+opencv-python-headless>=4.8,<5.0   # headless build — no GUI libs needed on Pi
